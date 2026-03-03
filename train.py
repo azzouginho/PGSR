@@ -122,6 +122,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
+    iter_75 = int(opt.iterations * 0.75)
 
     for iteration in range(first_iter, opt.iterations + 1):
         # if network_gui.conn == None:
@@ -398,6 +399,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
                 app_model.save_weights(scene.model_path, iteration)
+                
+            if iteration == iter_75:
+                scene.gaussians.apply_planar_prior_ransac(
+                    grid_res=0.015,       # Grid resolution (adjust according to scene, e.g., 1.5 cm)
+                    diffusion_iters=150,  # Number of Poisson diffusion smoothing steps
+                    num_planes=3          # Number of major planes to detect
+                )
     
     app_model.save_weights(scene.model_path, opt.iterations)
     torch.cuda.empty_cache()

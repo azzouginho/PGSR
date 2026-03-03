@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, build_scaling
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -21,6 +22,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from pytorch3d.transforms import quaternion_to_matrix
+import open3d as o3d
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -554,4 +556,152 @@ class GaussianModel:
         T = torch.tensor(fov_camera.T).float().cuda()
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
-    
+
+    def apply_planar_prior_ransac(self, grid_res=0.015, diffusion_iters=150, num_planes=3):
+        """
+        Extension: Filling unobserved areas (holes) using a Planar Prior.
+        Processes 'num_planes' sequentially to find dominant planes,
+        projects onto a 2D grid, and interpolates attributes to fill the gaps.
+        Parameters:
+        - grid_res: Resolution of the 2D grid for each plane (in world units).
+        - diffusion_iters: Number of iterations for the Poisson diffusion process (interpolation).
+        - num_planes: Number of dominant planes to detect and fill.
+        """
+        print(f"\n--- [EXTENSION] Launching Planar Prior (Searching for {num_planes} planes) ---")
+        
+        # 1. Extract current points
+        xyz = self._xyz.detach().cpu().numpy()
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        
+        # Track indices to map back to original PyTorch tensors after each plane removal
+        original_indices = np.arange(len(xyz))
+        
+        # Lists to store the new Gaussians for ALL planes
+        list_new_xyz = []
+        list_new_feat_dc = []
+        list_new_opacity = []
+        list_new_scaling = []
+        list_new_rotation = []
+
+        for plane_idx in range(num_planes):
+            if len(pcd.points) < 1000:
+                print("Not enough points left to find a plane.")
+                break
+                
+            # 2. RANSAC: Detect the dominant plane on the remaining points
+            plane_model, inliers = pcd.segment_plane(distance_threshold=0.02, ransac_n=3, num_iterations=1000)
+            real_inliers = original_indices[inliers] # True indices in the original PyTorch tensors
+            
+            [a, b, c, d] = plane_model
+            normal = np.array([a, b, c])
+            normal = normal / np.linalg.norm(normal)
+            inlier_xyz = np.asarray(pcd.points)[inliers]
+            
+            print(f"Plane {plane_idx + 1}/{num_planes} detected: {len(inliers)} Gaussians.")
+            
+            # 3. Create the local 2D coordinate system (U, V)
+            arbitrary = np.array([1, 0, 0]) if np.abs(normal[0]) < 0.9 else np.array([0, 1, 0])
+            u_vec = np.cross(normal, arbitrary)
+            u_vec = u_vec / np.linalg.norm(u_vec)
+            v_vec = np.cross(normal, u_vec)
+            
+            center = np.mean(inlier_xyz, axis=0)
+            centered_xyz = inlier_xyz - center
+            u_coords = np.dot(centered_xyz, u_vec)
+            v_coords = np.dot(centered_xyz, v_vec)
+            
+            u_min, u_max = u_coords.min(), u_coords.max()
+            v_min, v_max = v_coords.min(), v_coords.max()
+            width = int((u_max - u_min) / grid_res) + 1
+            height = int((v_max - v_min) / grid_res) + 1
+            
+            u_indices = np.clip(((u_coords - u_min) / grid_res).astype(int), 0, width - 1)
+            v_indices = np.clip(((v_coords - v_min) / grid_res).astype(int), 0, height - 1)
+            
+            # 4. Prepare attributes (Color, Opacity, Scale, Rotation)
+            feat_dc = self._features_dc.detach()[real_inliers].reshape(len(real_inliers), -1) # [N, 3]
+            opacity = self._opacity.detach()[real_inliers]                                    # [N, 1]
+            scaling = self._scaling.detach()[real_inliers]                                    # [N, 3]
+            rotation = self._rotation.detach()[real_inliers]                                  # [N, 4]
+            
+            # Concatenation: 3 + 1 + 3 + 4 = 11 channels total
+            all_attributes = torch.cat([feat_dc, opacity, scaling, rotation], dim=1)
+            channels = all_attributes.shape[1]
+            
+            grid = torch.zeros((1, channels, height, width), device="cuda", dtype=torch.float32)
+            mask = torch.zeros((1, 1, height, width), device="cuda", dtype=torch.float32)
+            
+            grid[0, :, v_indices, u_indices] = all_attributes.T
+            mask[0, 0, v_indices, u_indices] = 1.0
+            
+            # 5. Poisson Diffusion (2D Convolution) for interpolation
+            kernel = torch.tensor([[[[0, 1, 0], [1, 0, 1], [0, 1, 0]]]], dtype=torch.float32, device="cuda") / 4.0
+            kernel = kernel.repeat(channels, 1, 1, 1)
+            
+            diffused_grid = grid.clone()
+            for _ in range(diffusion_iters):
+                moyenne = F.conv2d(diffused_grid, kernel, padding=1, groups=channels)
+                # Dirichlet condition: only update empty pixels, keep original boundaries fixed
+                diffused_grid = diffused_grid * mask + moyenne * (1 - mask)
+            
+            # 6. Extract new points (originally empty, filled by diffusion)
+            # We check opacity to ensure we only spawn points that received significant diffused values
+            holes = (mask[0, 0] == 0) & (torch.abs(diffused_grid[0, 3]) > 0.01) 
+            v_new, u_new = torch.where(holes)
+            
+            if len(v_new) > 0:
+                # 7. 3D Reprojection
+                u_real = u_new.cpu().numpy() * grid_res + u_min
+                v_real = v_new.cpu().numpy() * grid_res + v_min
+                new_xyz = center + np.outer(u_real, u_vec) + np.outer(v_real, v_vec)
+                
+                # 8. Retrieve and format new attributes
+                new_attributes = diffused_grid[0, :, v_new, u_new].T 
+                
+                new_feat_dc = new_attributes[:, 0:3].unsqueeze(1)    # [N, 1, 3]
+                new_opacity = new_attributes[:, 3:4]                 # [N, 1]
+                new_scaling = new_attributes[:, 4:7]                 # [N, 3]
+                new_rotation_raw = new_attributes[:, 7:11]           # [N, 4]
+                
+                # Vital normalization for quaternions to ensure they represent valid rotations
+                new_rotation = F.normalize(new_rotation_raw, p=2, dim=1)
+                
+                # Store for final injection
+                list_new_xyz.append(torch.tensor(new_xyz, dtype=torch.float32, device="cuda"))
+                list_new_feat_dc.append(new_feat_dc)
+                list_new_opacity.append(new_opacity)
+                list_new_scaling.append(new_scaling)
+                list_new_rotation.append(new_rotation)
+                print(f"   -> {len(new_xyz)} holes filled on this plane.")
+            else:
+                print("   -> No holes to fill on this plane.")
+
+            # 9. Remove inliers from the Open3D point cloud for the next iteration (like in original RANSAC)
+            pcd = pcd.select_by_index(inliers, invert=True)
+            original_indices = np.delete(original_indices, inliers)
+        
+        # 10. Global injection into the model
+        if len(list_new_xyz) > 0:
+            final_xyz = torch.cat(list_new_xyz, dim=0)
+            final_feat_dc = torch.cat(list_new_feat_dc, dim=0)
+            final_opacity = torch.cat(list_new_opacity, dim=0)
+            final_scaling = torch.cat(list_new_scaling, dim=0)
+            final_rotation = torch.cat(list_new_rotation, dim=0)
+            
+            # Other features (initialized to zero and will be optimized later)
+            final_feat_rest = torch.zeros((len(final_xyz), self._features_rest.shape[1], 3), device="cuda")
+            final_knn_f = torch.zeros((len(final_xyz), self._knn_f.shape[1]), device="cuda")
+            
+            self.densification_postfix(
+                new_xyz=final_xyz,
+                new_knn_f=final_knn_f,
+                new_features_dc=final_feat_dc,
+                new_features_rest=final_feat_rest,
+                new_opacities=final_opacity,
+                new_scaling=final_scaling,
+                new_rotation=final_rotation
+            )
+            print(f"-> {len(final_xyz)} Gaussians injected in total\n")
+        else:
+            print("-> No holes were filled overall.\n")
