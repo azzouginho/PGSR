@@ -557,7 +557,7 @@ class GaussianModel:
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
 
-    def apply_planar_prior_ransac(self, grid_res=0.015, diffusion_iters=150, num_planes=3):
+    def apply_planar_prior_ransac(self, grid_res=0.02, diffusion_iters=200, num_planes=3):
         """
         Extension: Filling unobserved areas (holes) using a Planar Prior.
         Processes 'num_planes' sequentially to find dominant planes,
