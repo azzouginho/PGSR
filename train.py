@@ -122,7 +122,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
-    iter_75 = int(opt.iterations * 0.75)
 
     for iteration in range(first_iter, opt.iterations + 1):
         # if network_gui.conn == None:
@@ -400,13 +399,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
                 app_model.save_weights(scene.model_path, iteration)
                 
-            if iteration == iter_75:
-                scene.gaussians.apply_planar_prior_ransac(
-                    grid_res=0.015,       # Grid resolution (adjust according to scene, e.g., 1.5 cm)
-                    diffusion_iters=150,  # Number of Poisson diffusion smoothing steps
-                    num_planes=3          # Number of major planes to detect
-                )
+            if args.use_planar_prior and args.prior_timing < 1.0:
+                if iteration == int(opt.iterations * args.prior_timing):
+                    print(f"\n--- FILLING HOLES WITH PLANAR PRIOR (Timing : {args.prior_timing * 100}%) ---")
+                    scene.gaussians.apply_planar_prior_ransac(grid_res=0.02, diffusion_iters=200, num_planes=3)
     
+    if args.use_planar_prior and args.prior_timing == 1.0:
+        print("\n--- FILLING HOLES WITH PLANAR PRIOR (Post-Processing) ---")
+        scene.gaussians.apply_planar_prior_ransac(grid_res=0.02, diffusion_iters=200, num_planes=3)
     app_model.save_weights(scene.model_path, opt.iterations)
     torch.cuda.empty_cache()
 
@@ -491,6 +491,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--use_planar_prior", action="store_true", help="Filling holes with planar prior (RANSAC + Poisson)")
+    parser.add_argument("--prior_timing", type=float, default=0.95, help="Timing to add gaussians (ex: 0.75, 0.95, or 1.0 for Post-Processing)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

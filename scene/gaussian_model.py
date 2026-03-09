@@ -557,7 +557,7 @@ class GaussianModel:
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
 
-    def apply_planar_prior_ransac(self, grid_res=0.015, diffusion_iters=150, num_planes=3):
+    def apply_planar_prior_ransac(self, grid_res=0.02, diffusion_iters=200, num_planes=3):
         """
         Extension: Filling unobserved areas (holes) using a Planar Prior.
         Processes 'num_planes' sequentially to find dominant planes,
@@ -590,7 +590,7 @@ class GaussianModel:
                 break
                 
             # 2. RANSAC: Detect the dominant plane on the remaining points
-            plane_model, inliers = pcd.segment_plane(distance_threshold=0.02, ransac_n=3, num_iterations=1000)
+            plane_model, inliers = pcd.segment_plane(distance_threshold=0.03, ransac_n=3, num_iterations=2000)
             real_inliers = original_indices[inliers] # True indices in the original PyTorch tensors
             
             [a, b, c, d] = plane_model
@@ -611,13 +611,25 @@ class GaussianModel:
             u_coords = np.dot(centered_xyz, u_vec)
             v_coords = np.dot(centered_xyz, v_vec)
             
-            u_min, u_max = u_coords.min(), u_coords.max()
-            v_min, v_max = v_coords.min(), v_coords.max()
+            # --- SÉCURITÉ 1 : Utiliser les percentiles au lieu de min/max (Anti-Outliers) ---
+            u_min, u_max = np.percentile(u_coords, 2), np.percentile(u_coords, 98)
+            v_min, v_max = np.percentile(v_coords, 2), np.percentile(v_coords, 98)
+            
+            # --- SÉCURITÉ 2 : Limiter la taille maximale de la grille ---
+            max_size = 1500 # On force la grille à ne jamais dépasser 1500x1500 pixels
             width = int((u_max - u_min) / grid_res) + 1
             height = int((v_max - v_min) / grid_res) + 1
             
-            u_indices = np.clip(((u_coords - u_min) / grid_res).astype(int), 0, width - 1)
-            v_indices = np.clip(((v_coords - v_min) / grid_res).astype(int), 0, height - 1)
+            current_grid_res = grid_res
+            if width > max_size or height > max_size:
+                print(f"   ! Grille trop grande ({width}x{height}). Réduction automatique pour éviter l'OOM.")
+                scale_factor = max_size / max(width, height)
+                width = int(width * scale_factor)
+                height = int(height * scale_factor)
+                current_grid_res = grid_res / scale_factor # On s'adapte à la nouvelle résolution
+            
+            u_indices = np.clip(((u_coords - u_min) / current_grid_res).astype(int), 0, width - 1)
+            v_indices = np.clip(((v_coords - v_min) / current_grid_res).astype(int), 0, height - 1)
             
             # 4. Prepare attributes (Color, Opacity, Scale, Rotation)
             feat_dc = self._features_dc.detach()[real_inliers].reshape(len(real_inliers), -1) # [N, 3]
@@ -629,55 +641,60 @@ class GaussianModel:
             all_attributes = torch.cat([feat_dc, opacity, scaling, rotation], dim=1)
             channels = all_attributes.shape[1]
             
-            grid = torch.zeros((1, channels, height, width), device="cuda", dtype=torch.float32)
-            mask = torch.zeros((1, 1, height, width), device="cuda", dtype=torch.float32)
-            
-            grid[0, :, v_indices, u_indices] = all_attributes.T
-            mask[0, 0, v_indices, u_indices] = 1.0
-            
-            # 5. Poisson Diffusion (2D Convolution) for interpolation
-            kernel = torch.tensor([[[[0, 1, 0], [1, 0, 1], [0, 1, 0]]]], dtype=torch.float32, device="cuda") / 4.0
-            kernel = kernel.repeat(channels, 1, 1, 1)
-            
-            diffused_grid = grid.clone()
-            for _ in range(diffusion_iters):
-                moyenne = F.conv2d(diffused_grid, kernel, padding=1, groups=channels)
-                # Dirichlet condition: only update empty pixels, keep original boundaries fixed
-                diffused_grid = diffused_grid * mask + moyenne * (1 - mask)
-            
-            # 6. Extract new points (originally empty, filled by diffusion)
-            # We check opacity to ensure we only spawn points that received significant diffused values
-            holes = (mask[0, 0] == 0) & (torch.abs(diffused_grid[0, 3]) > 0.01) 
-            v_new, u_new = torch.where(holes)
-            
-            if len(v_new) > 0:
-                # 7. 3D Reprojection
-                u_real = u_new.cpu().numpy() * grid_res + u_min
-                v_real = v_new.cpu().numpy() * grid_res + v_min
-                new_xyz = center + np.outer(u_real, u_vec) + np.outer(v_real, v_vec)
+            # --- SÉCURITÉ 3 : Couper le Gradient pour sauver la RAM ---
+            with torch.no_grad():
+                grid = torch.zeros((1, channels, height, width), device="cuda", dtype=torch.float32)
+                mask = torch.zeros((1, 1, height, width), device="cuda", dtype=torch.float32)
                 
-                # 8. Retrieve and format new attributes
-                new_attributes = diffused_grid[0, :, v_new, u_new].T 
+                grid[0, :, v_indices, u_indices] = all_attributes.T
+                mask[0, 0, v_indices, u_indices] = 1.0
                 
-                new_feat_dc = new_attributes[:, 0:3].unsqueeze(1)    # [N, 1, 3]
-                new_opacity = new_attributes[:, 3:4]                 # [N, 1]
-                new_scaling = new_attributes[:, 4:7]                 # [N, 3]
-                new_rotation_raw = new_attributes[:, 7:11]           # [N, 4]
+                # 5. Poisson Diffusion (2D Convolution) for interpolation
+                kernel = torch.tensor([[[[0, 1, 0], [1, 0, 1], [0, 1, 0]]]], dtype=torch.float32, device="cuda") / 4.0
+                kernel = kernel.repeat(channels, 1, 1, 1)
                 
-                # Vital normalization for quaternions to ensure they represent valid rotations
-                new_rotation = F.normalize(new_rotation_raw, p=2, dim=1)
+                diffused_grid = grid.clone()
+                for _ in range(diffusion_iters):
+                    moyenne = F.conv2d(diffused_grid, kernel, padding=1, groups=channels)
+                    # Dirichlet condition: only update empty pixels, keep original boundaries fixed
+                    diffused_grid = diffused_grid * mask + moyenne * (1 - mask)
                 
-                # Store for final injection
-                list_new_xyz.append(torch.tensor(new_xyz, dtype=torch.float32, device="cuda"))
-                list_new_feat_dc.append(new_feat_dc)
-                list_new_opacity.append(new_opacity)
-                list_new_scaling.append(new_scaling)
-                list_new_rotation.append(new_rotation)
-                print(f"   -> {len(new_xyz)} holes filled on this plane.")
-            else:
-                print("   -> No holes to fill on this plane.")
+                # 6. Extract new points
+                holes = (mask[0, 0] == 0) & (torch.abs(diffused_grid[0, 3]) > 0.01) 
+                v_new, u_new = torch.where(holes)
+                
+                if len(v_new) > 0:
+                    # 7. 3D Reprojection
+                    u_real = u_new.cpu().numpy() * current_grid_res + u_min
+                    v_real = v_new.cpu().numpy() * current_grid_res + v_min
+                    new_xyz = center + np.outer(u_real, u_vec) + np.outer(v_real, v_vec)
+                    
+                    # 8. Retrieve and format new attributes
+                    new_attributes = diffused_grid[0, :, v_new, u_new].T 
+                    
+                    new_feat_dc = new_attributes[:, 0:3].unsqueeze(1)    # [N, 1, 3]
+                    new_opacity = new_attributes[:, 3:4]                 # [N, 1]
+                    new_scaling = new_attributes[:, 4:7]                 # [N, 3]
+                    new_rotation_raw = new_attributes[:, 7:11]           # [N, 4]
+                    
+                    # Vital normalization for quaternions to ensure they represent valid rotations
+                    new_rotation = F.normalize(new_rotation_raw, p=2, dim=1)
+                    
+                    # Store for final injection
+                    list_new_xyz.append(torch.tensor(new_xyz, dtype=torch.float32, device="cuda"))
+                    list_new_feat_dc.append(new_feat_dc)
+                    list_new_opacity.append(new_opacity)
+                    list_new_scaling.append(new_scaling)
+                    list_new_rotation.append(new_rotation)
+                    print(f"   -> {len(new_xyz)} holes filled on this plane.")
+                else:
+                    print("   -> No holes to fill on this plane.")
 
-            # 9. Remove inliers from the Open3D point cloud for the next iteration (like in original RANSAC)
+                # --- SÉCURITÉ 4 : Nettoyage agressif du cache GPU ---
+                del grid, mask, diffused_grid, moyenne, kernel, all_attributes
+                torch.cuda.empty_cache()
+
+            # 9. Remove inliers from the Open3D point cloud for the next iteration
             pcd = pcd.select_by_index(inliers, invert=True)
             original_indices = np.delete(original_indices, inliers)
         
