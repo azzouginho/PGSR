@@ -29,6 +29,8 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
+import open3d as o3d
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -328,7 +330,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if mask.sum() > 0:
                             ncc_loss = ncc_weight * ncc.mean()
                             loss += ncc_loss
+        if args.use_planar_prior and iteration > opt.single_view_weight_from_iter:
+            # 1. Extraction RANSAC (Une seule fois, après stabilisation)
+            if not hasattr(scene, "dominant_planes") and iteration == opt.single_view_weight_from_iter + 10:
+                print("\n[INFO] Extracting dominant planes via RANSAC for Opacity-Guided Regularization...")
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(gaussians.get_xyz.detach().cpu().numpy())
+                scene.dominant_planes = []
+                for _ in range(5): # On extrait les 5 plans majeurs
+                    if len(pcd.points) < 1000: break
+                    plane_model, inliers = pcd.segment_plane(distance_threshold=0.03, ransac_n=3, num_iterations=1000)
+                    scene.dominant_planes.append(torch.tensor(plane_model, dtype=torch.float32, device="cuda"))
+                    pcd = pcd.select_by_index(inliers, invert=True)
+                print(f"[INFO] Found {len(scene.dominant_planes)} dominant planes.")
 
+            # 2. Détection des trous par lancer de rayons & Loss
+            if hasattr(scene, "dominant_planes") and len(scene.dominant_planes) > 0:
+                depth_render = render_pkg["plane_depth"].squeeze() # [H, W]
+                H, W = depth_render.shape
+                
+                # Calcul de la direction des rayons dans l'espace Monde
+                ix, iy = torch.meshgrid(torch.arange(W, device="cuda"), torch.arange(H, device="cuda"), indexing='xy')
+                x = (ix - viewpoint_cam.Cx) / viewpoint_cam.Fx
+                y = (iy - viewpoint_cam.Cy) / viewpoint_cam.Fy
+                z = torch.ones_like(x)
+                d_c = torch.stack([x, y, z], dim=-1)
+                
+                C2W = viewpoint_cam.world_view_transform[:3, :3].inverse()
+                d_w = torch.matmul(d_c, C2W) # [H, W, 3]
+                
+                camera_center = viewpoint_cam.camera_center # [3]
+                opacity_loss = 0.0
+                
+                # Projection 2D des Gaussiennes pour voir lesquelles tombent dans le trou
+                xyz = gaussians.get_xyz
+                xyz_hom = torch.cat([xyz, torch.ones_like(xyz[..., :1])], dim=-1)
+                pts_proj_4d = torch.matmul(xyz_hom, viewpoint_cam.full_proj_transform)
+                pts_proj_2d = pts_proj_4d[..., :2] / (pts_proj_4d[..., 3:4] + 1e-7)
+                u = ((pts_proj_2d[:, 0] + 1.0) * W / 2.0).long()
+                v = ((pts_proj_2d[:, 1] + 1.0) * H / 2.0).long()
+                valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (pts_proj_4d[..., 3] > 0.2)
+                
+                for plane in scene.dominant_planes:
+                    n = plane[:3]
+                    d = plane[3]
+                    
+                    denom = (d_w * n).sum(dim=-1)
+                    valid_rays = torch.abs(denom) > 1e-5
+                    
+                    # Profondeur théorique du plan
+                    t_plane = torch.zeros_like(depth_render)
+                    t_plane[valid_rays] = -(torch.dot(n, camera_center) + d) / denom[valid_rays]
+                    
+                    # CONDITION DU TROU : profondeur rendue trop lointaine OU tape dans le vide
+                    hole_mask = ((depth_render > t_plane + 0.2) | (depth_render < 1e-3)) & (t_plane > 0) & (t_plane < 100.0) & valid_rays
+                    
+                    if hole_mask.sum() > 0:
+                        dist_to_plane = torch.abs((xyz * n).sum(dim=-1) + d)
+                        plane_mask = dist_to_plane < 0.3 # Les Gaussiennes à moins de 30cm du plan
+                        
+                        in_hole = torch.zeros(xyz.shape[0], dtype=torch.bool, device="cuda")
+                        in_hole[valid_uv] = hole_mask[v[valid_uv], u[valid_uv]]
+                        
+                        # Cibles = Proches du plan ET projetées dans le trou de la caméra
+                        target_gaussians = plane_mask & in_hole
+                        
+                        if target_gaussians.sum() > 0:
+                            opacities = gaussians.get_opacity
+                            # LOSS OPACITÉ : on force l'opacité à 1 pour déclencher le clonage de 3DGS
+                            opacity_loss += (1.0 - opacities[target_gaussians]).pow(2).mean()
+                    
+                loss += opacity_loss * args.planar_weight
+                    
         loss.backward()
         iter_end.record()
 
@@ -398,17 +471,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
                 app_model.save_weights(scene.model_path, iteration)
-                
-            if args.use_planar_prior and args.prior_timing < 1.0:
-                if iteration == int(opt.iterations * args.prior_timing):
-                    print(f"\n--- FILLING HOLES WITH PLANAR PRIOR (Timing : {args.prior_timing * 100}%) ---")
-                    scene.gaussians.apply_planar_prior_ransac(grid_res=0.02, diffusion_iters=200, num_planes=3)
-    
-    if args.use_planar_prior and args.prior_timing == 1.0:
-        print("\n--- FILLING HOLES WITH PLANAR PRIOR (Post-Processing) ---")
-        scene.gaussians.apply_planar_prior_ransac(grid_res=0.02, diffusion_iters=200, num_planes=3)
-    app_model.save_weights(scene.model_path, opt.iterations)
-    torch.cuda.empty_cache()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -491,8 +553,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--use_planar_prior", action="store_true", help="Filling holes with planar prior (RANSAC + Poisson)")
-    parser.add_argument("--prior_timing", type=float, default=0.95, help="Timing to add gaussians (ex: 0.75, 0.95, or 1.0 for Post-Processing)")
+    parser.add_argument("--use_planar_prior", action="store_true", help="Filling holes with planar prior")
+    parser.add_argument("--planar_weight", type=float, default=0.5, help="Poids de la loss de planar regularization")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
