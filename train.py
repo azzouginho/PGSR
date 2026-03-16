@@ -471,7 +471,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
                 app_model.save_weights(scene.model_path, iteration)
-
+                
+    if args.apply_planar_prior_final:
+        print("\n[POST-PROCESS] Application du Planar Prior RANSAC...")
+        gaussians.apply_planar_prior_ransac(grid_res=0.02, diffusion_iters=200, num_planes=5)
+        
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -555,6 +559,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--use_planar_prior", action="store_true", help="Filling holes with planar prior")
     parser.add_argument("--planar_weight", type=float, default=0.5, help="Poids de la loss de planar regularization")
+    parser.add_argument("--apply_planar_prior_final", action="store_true", help="Applique l'extension de points planaire après l'entraînement")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
